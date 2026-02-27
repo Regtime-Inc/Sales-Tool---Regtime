@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, lazy, Suspense } from 'react';
+import { useState, useCallback, useEffect, useRef, lazy, Suspense, Component, type ReactNode, type ErrorInfo } from 'react';
 import { Building2, AlertCircle, Search, Compass, FileText, ClipboardPaste, Users } from 'lucide-react';
 import SearchInput from './components/SearchInput';
 import ResultsPanel from './components/ResultsPanel';
@@ -10,7 +10,7 @@ import type { AppliedOverrides } from './types/pdf';
 import type { DiscoveryHistoryEntry, AcrisSearchHistoryEntry } from './types/searchHistory';
 import type { DiscoveryFilters } from './types/discovery';
 
-// ── Lazy-loaded tab pages (Improvement 2) ────────────────────────────────
+// ── Lazy-loaded tab pages (code-split) ───────────────────────────────────
 const DiscoveryPage = lazy(() => import('./components/DiscoveryPage'));
 const AcrisDocsPage = lazy(() => import('./components/AcrisDocsPage'));
 const AcrisAssistPage = lazy(() => import('./components/AcrisAssistPage'));
@@ -20,25 +20,51 @@ type Tab = 'analyze' | 'discovery' | 'acris' | 'acris-assist' | 'owners';
 
 const VALID_TABS: Tab[] = ['analyze', 'discovery', 'acris', 'acris-assist', 'owners'];
 
-// ── Hash-based routing hook (Improvement 1) ──────────────────────────────
+// ── Lazy-load error boundary ─────────────────────────────────────────────
+class LazyErrorBoundary extends Component<
+  { fallback: ReactNode; children: ReactNode },
+  { hasError: boolean }
+> {
+  state = { hasError: false };
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[LazyErrorBoundary]', error, info);
+  }
+  render() {
+    if (this.state.hasError) return this.props.fallback;
+    return this.props.children;
+  }
+}
+
+// ── Hash-based routing ───────────────────────────────────────────────────
 function parseHash(): { tab: Tab; param?: string } {
-  const raw = window.location.hash.replace(/^#\/?/, '');
-  if (!raw) return { tab: 'analyze' };
+  try {
+    const raw = (window.location.hash || '').replace(/^#\/?/, '');
+    if (!raw) return { tab: 'analyze' };
 
-  const slashIdx = raw.indexOf('/');
-  const segment = slashIdx >= 0 ? raw.substring(0, slashIdx) : raw;
-  const param = slashIdx >= 0 ? decodeURIComponent(raw.substring(slashIdx + 1)) : undefined;
+    const slashIdx = raw.indexOf('/');
+    const segment = slashIdx >= 0 ? raw.substring(0, slashIdx) : raw;
+    const param = slashIdx >= 0 ? decodeURIComponent(raw.substring(slashIdx + 1)) : undefined;
 
-  if (VALID_TABS.includes(segment as Tab)) {
-    return { tab: segment as Tab, param: param || undefined };
+    if (VALID_TABS.includes(segment as Tab)) {
+      return { tab: segment as Tab, param: param || undefined };
+    }
+  } catch {
+    // Ignore hash parse errors
   }
   return { tab: 'analyze' };
 }
 
 function setHash(tab: Tab, param?: string) {
-  const hash = param ? `#${tab}/${encodeURIComponent(param)}` : `#${tab}`;
-  if (window.location.hash !== hash) {
-    window.history.pushState(null, '', hash);
+  try {
+    const hash = param ? `#${tab}/${encodeURIComponent(param)}` : `#${tab}`;
+    if (window.location.hash !== hash) {
+      window.history.pushState(null, '', hash);
+    }
+  } catch {
+    // Ignore in restricted environments
   }
 }
 
@@ -53,7 +79,6 @@ function useHashTab() {
     setHashParam(param);
     suppressRef.current = true;
     setHash(newTab, param);
-    // Reset suppress after a tick so hashchange from pushState is ignored
     requestAnimationFrame(() => { suppressRef.current = false; });
   }, []);
 
@@ -83,6 +108,15 @@ function TabSpinner() {
   );
 }
 
+function TabLoadError() {
+  return (
+    <div className="text-center py-16">
+      <AlertCircle className="h-8 w-8 text-red-400 mx-auto mb-3" />
+      <p className="text-sm text-slate-600">Failed to load this section. Try refreshing the page.</p>
+    </div>
+  );
+}
+
 export default function App() {
   const { tab, hashParam, setTab } = useHashTab();
   const [result, setResult] = useState<AnalysisResult | null>(null);
@@ -94,20 +128,6 @@ export default function App() {
   const [discoveryFiltersOverride, setDiscoveryFiltersOverride] = useState<DiscoveryFilters | null>(null);
   const [acrisRefreshKey, setAcrisRefreshKey] = useState(0);
   const [ownerSearchPrefill, setOwnerSearchPrefill] = useState<string | null>(null);
-
-  // ── Deep-link: auto-analyze BBL from hash on mount ──────────────────
-  const autoAnalyzeRef = useRef(false);
-  useEffect(() => {
-    if (autoAnalyzeRef.current) return;
-    if (tab === 'analyze' && hashParam && /^\d{10}$/.test(hashParam)) {
-      autoAnalyzeRef.current = true;
-      handleAnalyze(hashParam);
-    }
-    if (tab === 'owners' && hashParam) {
-      setOwnerSearchPrefill(hashParam);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   const handleAcrisDataIngested = useCallback(() => {
     setAcrisRefreshKey((k) => k + 1);
@@ -143,7 +163,6 @@ export default function App() {
     try {
       const data = await analyzeProperty(input);
       setResult(data);
-      // Update hash with BBL for deep-linking
       setTab('analyze', data.bbl);
       recordAnalysisSearch({
         input,
@@ -162,6 +181,23 @@ export default function App() {
       setLoading(false);
     }
   }, [setTab]);
+
+  // ── Deep-link: auto-analyze BBL from hash on mount ──────────────────
+  const didAutoAnalyze = useRef(false);
+  useEffect(() => {
+    if (didAutoAnalyze.current) return;
+    didAutoAnalyze.current = true;
+    try {
+      const { tab: initTab, param } = parseHash();
+      if (initTab === 'analyze' && param && /^\d{10}$/.test(param)) {
+        handleAnalyze(param);
+      } else if (initTab === 'owners' && param) {
+        setOwnerSearchPrefill(param);
+      }
+    } catch {
+      // Ignore deep-link errors
+    }
+  }, [handleAnalyze]);
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -240,7 +276,7 @@ export default function App() {
       <main className="max-w-5xl mx-auto px-4 py-8 space-y-8">
         <ErrorBoundary label="Application">
 
-        {/* Analyze tab: kept always mounted (hidden) to preserve results */}
+        {/* Analyze tab: always mounted (hidden) to preserve results */}
         <div className={tab !== 'analyze' ? 'hidden' : ''}>
             <div className="space-y-8">
             <SearchInput onAnalyze={handleAnalyze} loading={loading} historyVersion={historyVersion} onSelectDiscovery={handleSelectDiscovery} onSelectOwner={handleSelectOwner} onSelectAcris={handleSelectAcris} />
@@ -286,34 +322,42 @@ export default function App() {
             </div>
         </div>
 
-        {/* Lazy-rendered tabs: only mount when active (Improvement 2) */}
+        {/* Lazy-rendered tabs: only mount when active */}
         {tab === 'discovery' && (
-          <Suspense fallback={<TabSpinner />}>
-            <DiscoveryPage
-              onAnalyze={handleAnalyze}
-              onHistoryChange={() => setHistoryVersion((v) => v + 1)}
-              filtersOverride={discoveryFiltersOverride}
-              onFiltersOverrideConsumed={() => setDiscoveryFiltersOverride(null)}
-            />
-          </Suspense>
+          <LazyErrorBoundary fallback={<TabLoadError />}>
+            <Suspense fallback={<TabSpinner />}>
+              <DiscoveryPage
+                onAnalyze={handleAnalyze}
+                onHistoryChange={() => setHistoryVersion((v) => v + 1)}
+                filtersOverride={discoveryFiltersOverride}
+                onFiltersOverrideConsumed={() => setDiscoveryFiltersOverride(null)}
+              />
+            </Suspense>
+          </LazyErrorBoundary>
         )}
 
         {tab === 'acris' && (
-          <Suspense fallback={<TabSpinner />}>
-            <AcrisDocsPage onAnalyze={handleAnalyze} refreshKey={acrisRefreshKey} onHistoryChange={() => setHistoryVersion((v) => v + 1)} />
-          </Suspense>
+          <LazyErrorBoundary fallback={<TabLoadError />}>
+            <Suspense fallback={<TabSpinner />}>
+              <AcrisDocsPage onAnalyze={handleAnalyze} refreshKey={acrisRefreshKey} onHistoryChange={() => setHistoryVersion((v) => v + 1)} />
+            </Suspense>
+          </LazyErrorBoundary>
         )}
 
         {tab === 'acris-assist' && (
-          <Suspense fallback={<TabSpinner />}>
-            <AcrisAssistPage onAnalyze={handleAnalyze} onDataIngested={handleAcrisDataIngested} />
-          </Suspense>
+          <LazyErrorBoundary fallback={<TabLoadError />}>
+            <Suspense fallback={<TabSpinner />}>
+              <AcrisAssistPage onAnalyze={handleAnalyze} onDataIngested={handleAcrisDataIngested} />
+            </Suspense>
+          </LazyErrorBoundary>
         )}
 
         {tab === 'owners' && (
-          <Suspense fallback={<TabSpinner />}>
-            <OwnersPage onAnalyze={handleAnalyze} onHistoryChange={() => setHistoryVersion((v) => v + 1)} searchPrefill={ownerSearchPrefill} onSearchPrefillConsumed={() => setOwnerSearchPrefill(null)} />
-          </Suspense>
+          <LazyErrorBoundary fallback={<TabLoadError />}>
+            <Suspense fallback={<TabSpinner />}>
+              <OwnersPage onAnalyze={handleAnalyze} onHistoryChange={() => setHistoryVersion((v) => v + 1)} searchPrefill={ownerSearchPrefill} onSearchPrefillConsumed={() => setOwnerSearchPrefill(null)} />
+            </Suspense>
+          </LazyErrorBoundary>
         )}
 
         </ErrorBoundary>
